@@ -10,6 +10,8 @@ import { v4 as uuidv4 } from "uuid";
 import path from "path";
 import { fileURLToPath } from "url";
 import * as db from "./db.js";
+import multer from "multer";
+import fs from "fs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -344,6 +346,150 @@ app.delete("/api/faq/:faqId", (req, res) => {
   }
 });
 
+// ===================== 知识库文件上传 API =====================
+
+// 知识库存储目录
+const KNOWLEDGE_DIR = path.join(process.cwd(), "knowledge");
+if (!fs.existsSync(KNOWLEDGE_DIR)) {
+  fs.mkdirSync(KNOWLEDGE_DIR, { recursive: true });
+}
+
+// multer 配置
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => {
+      cb(null, KNOWLEDGE_DIR);
+    },
+    filename: (_req, file, cb) => {
+      // 使用 sessionId 作为子目录，避免文件名冲突
+      const sessionId = _req.body.sessionId || "default";
+      const sessionDir = path.join(KNOWLEDGE_DIR, sessionId);
+      if (!fs.existsSync(sessionDir)) {
+        fs.mkdirSync(sessionDir, { recursive: true });
+      }
+      // 保留原始文件名
+      cb(null, path.join(sessionId, file.originalname));
+    }
+  }),
+  limits: { fileSize: 10 * 1024 * 1024 } // 10MB 限制
+});
+
+// 上传文件
+app.post("/api/knowledge/upload", upload.single("file"), (req, res) => {
+  try {
+    const sessionId = req.body.sessionId || "default";
+    const file = req.file;
+    
+    if (!file) {
+      return res.status(400).json({ error: "请选择要上传的文件" });
+    }
+
+    // 保存到 session 目录
+    const sessionDir = path.join(KNOWLEDGE_DIR, sessionId);
+    if (!fs.existsSync(sessionDir)) {
+      fs.mkdirSync(sessionDir, { recursive: true });
+    }
+    
+    const destPath = path.join(sessionDir, file.originalname);
+    fs.copyFileSync(file.path, destPath);
+    fs.unlinkSync(file.path); // 删除临时文件
+
+    // 构建索引条目
+    const indexEntry = {
+      path: path.join(sessionId, file.originalname).replace(/\\/g, "/"),
+      title: path.basename(file.originalname, path.extname(file.originalname)),
+      tags: "",
+      uploadedAt: new Date().toISOString()
+    };
+
+    // 更新索引文件
+    const indexPath = path.join(KNOWLEDGE_DIR, "index.jsonl");
+    let indexData: any[] = [];
+    if (fs.existsSync(indexPath)) {
+      const content = fs.readFileSync(indexPath, "utf-8");
+      indexData = content.trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
+    }
+    indexData = indexData.filter(e => e.path !== indexEntry.path);
+    indexData.push(indexEntry);
+    fs.writeFileSync(indexPath, indexData.map(e => JSON.stringify(e)).join("\n"));
+
+    res.json({ 
+      success: true, 
+      file: { 
+        name: file.originalname, 
+        path: indexEntry.path,
+        size: file.size 
+      } 
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "上传失败" });
+  }
+});
+
+// 列出知识库文件
+app.get("/api/knowledge/list", (req, res) => {
+  try {
+    const { sessionId } = req.query;
+    const indexPath = path.join(KNOWLEDGE_DIR, "index.jsonl");
+    
+    let files: any[] = [];
+    if (fs.existsSync(indexPath)) {
+      const content = fs.readFileSync(indexPath, "utf-8");
+      files = content.trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
+      
+      if (sessionId) {
+        files = files.filter(f => f.path.startsWith(String(sessionId)));
+      }
+    }
+
+    res.json({ files });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "获取文件列表失败" });
+  }
+});
+
+// 删除知识库文件
+app.delete("/api/knowledge/file", (req, res) => {
+  try {
+    const { path: filePath } = req.query;
+    if (!filePath) return res.status(400).json({ error: "缺少文件路径" });
+
+    const fullPath = path.join(KNOWLEDGE_DIR, String(filePath));
+    if (fs.existsSync(fullPath)) {
+      fs.unlinkSync(fullPath);
+    }
+
+    // 更新索引
+    const indexPath = path.join(KNOWLEDGE_DIR, "index.jsonl");
+    if (fs.existsSync(indexPath)) {
+      let indexData = fs.readFileSync(indexPath, "utf-8")
+        .trim().split("\n").filter(Boolean)
+        .map(line => JSON.parse(line))
+        .filter(e => e.path !== filePath);
+      fs.writeFileSync(indexPath, indexData.map(e => JSON.stringify(e)).join("\n"));
+    }
+
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "删除失败" });
+  }
+});
+
+// 获取知识库索引内容（供 Agent 使用）
+app.get("/api/knowledge/index", (_req, res) => {
+  try {
+    const indexPath = path.join(KNOWLEDGE_DIR, "index.jsonl");
+    if (!fs.existsSync(indexPath)) {
+      return res.json({ entries: [] });
+    }
+    const content = fs.readFileSync(indexPath, "utf-8");
+    const entries = content.trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
+    res.json({ entries });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "获取索引失败" });
+  }
+});
+
 // ===================== 管理后台统计 API =====================
 
 app.get("/api/admin/stats", (_req, res) => {
@@ -450,6 +596,25 @@ app.post("/api/chat", async (req, res) => {
   res.setHeader("Connection", "keep-alive");
 
   try {
+    // 获取知识库文件索引
+    let knowledgeBaseInfo = "";
+    try {
+      const indexPath = path.join(KNOWLEDGE_DIR, "index.jsonl");
+      if (fs.existsSync(indexPath)) {
+        const content = fs.readFileSync(indexPath, "utf-8");
+        const entries = content.trim().split("\n").filter(Boolean)
+          .map(line => JSON.parse(line))
+          .filter(e => e.path.startsWith(session.id));
+        if (entries.length > 0) {
+          knowledgeBaseInfo = `\n## 用户上传知识库\n当前会话已上传 ${entries.length} 个知识文件：\n` + 
+            entries.map(e => `- ${e.path.split('/').pop()} (${e.title})`).join('\n') +
+            `\n知识库目录: ${KNOWLEDGE_DIR}`;
+        }
+      }
+    } catch (e) {
+      console.error("[Knowledge] 读取索引失败:", e);
+    }
+
     // 构建附加 FAQ 上下文的提示词
     const faqResults = db.searchFaq(message);
     let enrichedPrompt = message;
@@ -458,6 +623,11 @@ app.post("/api/chat", async (req, res) => {
       enrichedPrompt = `${message}\n\n[系统知识库参考（仅供你参考，不要直接暴露给用户）]\n${faqContext}`;
       // 增加 FAQ 命中计数
       faqResults.forEach(f => db.incrementFaqHit(f.id));
+    }
+
+    // 追加知识库信息
+    if (knowledgeBaseInfo) {
+      enrichedPrompt += knowledgeBaseInfo;
     }
 
     const canUseTool: CanUseTool = async (toolName, input, options) => {

@@ -4,8 +4,8 @@ import { Model, Session, PermissionMode, CustomAgent, PermissionRequest } from '
 import { NewChatView } from '../components/NewChatView';
 import { ChatMessages } from '../components/ChatMessages';
 import { ChatInput } from '../components/ChatInput';
-import { Button, Tag, Rate, Textarea, Dialog, NotificationPlugin } from 'tdesign-react';
-import { ServiceIcon, StarIcon, CheckCircleIcon } from 'tdesign-icons-react';
+import { Button, Tag, Rate, Textarea, Dialog, NotificationPlugin, Upload, Card, Space, Popconfirm, Loading } from 'tdesign-react';
+import { ServiceIcon, StarIcon, CheckCircleIcon, FileIcon, UploadIcon, DeleteIcon } from 'tdesign-icons-react';
 
 const CustomerServiceIcon = ServiceIcon;
 
@@ -80,6 +80,75 @@ export function ChatPage({
   const [satisfactionScore, setSatisfactionScore] = useState(5);
   const [satisfactionComment, setSatisfactionComment] = useState('');
   const [satisfactionSubmitted, setSatisfactionSubmitted] = useState(false);
+
+  // 知识库管理
+  const [showKnowledgeBase, setShowKnowledgeBase] = useState(false);
+  const [knowledgeFiles, setKnowledgeFiles] = useState<any[]>([]);
+  const [uploadingFile, setUploadingFile] = useState(false);
+
+  // 获取知识库文件列表
+  const fetchKnowledgeFiles = useCallback(async () => {
+    try {
+      const sessionId = currentSession?.id || 'default';
+      const res = await fetch(`/api/knowledge/list?sessionId=${sessionId}`);
+      const data = await res.json();
+      setKnowledgeFiles(data.files || []);
+    } catch (err) {
+      console.error('获取知识库文件失败:', err);
+    }
+  }, [currentSession?.id]);
+
+  // 上传文件
+  const handleUploadFile = useCallback(async (file: File) => {
+    if (!currentSession) {
+      NotificationPlugin.warning({ title: '请先创建对话', duration: 2000, placement: 'top-right' });
+      return;
+    }
+    setUploadingFile(true);
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('sessionId', currentSession.id);
+      const res = await fetch('/api/knowledge/upload', {
+        method: 'POST',
+        body: formData,
+      });
+      const data = await res.json();
+      if (data.success) {
+        NotificationPlugin.success({ title: '文件上传成功', duration: 2000, placement: 'top-right' });
+        fetchKnowledgeFiles();
+      } else {
+        NotificationPlugin.error({ title: data.error || '上传失败', duration: 2000, placement: 'top-right' });
+      }
+    } catch (err) {
+      NotificationPlugin.error({ title: '上传失败', duration: 2000, placement: 'top-right' });
+    } finally {
+      setUploadingFile(false);
+    }
+  }, [currentSession, fetchKnowledgeFiles]);
+
+  // 删除文件
+  const handleDeleteFile = useCallback(async (filePath: string) => {
+    try {
+      const res = await fetch(`/api/knowledge/file?path=${encodeURIComponent(filePath)}`, {
+        method: 'DELETE',
+      });
+      const data = await res.json();
+      if (data.success) {
+        NotificationPlugin.success({ title: '文件已删除', duration: 2000, placement: 'top-right' });
+        fetchKnowledgeFiles();
+      }
+    } catch (err) {
+      NotificationPlugin.error({ title: '删除失败', duration: 2000, placement: 'top-right' });
+    }
+  }, [fetchKnowledgeFiles]);
+
+  // 打开知识库面板时获取文件列表
+  useEffect(() => {
+    if (showKnowledgeBase) {
+      fetchKnowledgeFiles();
+    }
+  }, [showKnowledgeBase, fetchKnowledgeFiles]);
 
   // 当会话切换时，重置满意度状态
   useEffect(() => {
@@ -189,6 +258,16 @@ export function ChatPage({
                     已评分 {currentSession.satisfaction}★
                   </Tag>
                 )}
+                {/* 知识库管理按钮 */}
+                <Button
+                  size="small"
+                  variant="outline"
+                  theme="primary"
+                  icon={<FileIcon />}
+                  onClick={() => setShowKnowledgeBase(true)}
+                >
+                  知识库
+                </Button>
               </div>
             )}
 
@@ -282,6 +361,76 @@ export function ChatPage({
               autosize={{ minRows: 3, maxRows: 5 }}
             />
           </div>
+        </div>
+      </Dialog>
+
+      {/* 知识库管理弹窗 */}
+      <Dialog
+        header="知识库管理"
+        visible={showKnowledgeBase}
+        onClose={() => setShowKnowledgeBase(false)}
+        width={600}
+        footer={false}
+      >
+        <div className="py-2 space-y-4">
+          <div className="flex items-center justify-between">
+            <p className="text-sm" style={{ color: 'var(--td-text-color-secondary)' }}>
+              上传文件供 Agent 检索，支持 .md, .txt, .json 等文本文件
+            </p>
+          </div>
+          
+          {/* 上传区域 */}
+          <Upload
+            draggable
+            accept=".md,.txt,.json,.html,.xml"
+            disabled={uploadingFile}
+            showUploadProgress
+            onSelectChange={(files) => {
+              if (files && files.length > 0) {
+                handleUploadFile(files[0] as any);
+              }
+            }}
+          >
+            <div className="p-8 text-center">
+              {uploadingFile ? (
+                <Loading />
+              ) : (
+                <>
+                  <UploadIcon size="32px" style={{ color: 'var(--td-text-color-placeholder)' }} />
+                  <p className="mt-2 text-sm" style={{ color: 'var(--td-text-color-secondary)' }}>
+                    点击或拖拽文件到此处上传
+                  </p>
+                </>
+              )}
+            </div>
+          </Upload>
+
+          {/* 文件列表 */}
+          {knowledgeFiles.length > 0 ? (
+            <div className="space-y-2">
+              <p className="text-sm font-medium">已上传文件 ({knowledgeFiles.length})</p>
+              {knowledgeFiles.map((file, idx) => (
+                <Card key={idx} size="small" bordered className="flex items-center justify-between">
+                  <div className="flex items-center gap-2 overflow-hidden">
+                    <FileIcon />
+                    <span className="truncate">{file.path.split('/').pop()}</span>
+                  </div>
+                  <Popconfirm
+                    content="确认删除该文件？"
+                    onConfirm={() => handleDeleteFile(file.path)}
+                  >
+                    <Button size="small" variant="text" theme="danger" icon={<DeleteIcon />}>
+                      删除
+                    </Button>
+                  </Popconfirm>
+                </Card>
+              ))}
+            </div>
+          ) : (
+            <div className="text-center py-4 text-sm" style={{ color: 'var(--td-text-color-placeholder)' }}>
+              暂无上传文件
+            </div>
+          )}
         </div>
       </Dialog>
     </>
